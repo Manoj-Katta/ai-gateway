@@ -1,68 +1,71 @@
-# AI Gateway — High-Performance LLM Semantic Proxy & Rate Limiter
+# High-Performance AI Gateway (Semantic Cache + Token Rate Limiter)
 
-An asynchronous LLM proxy service built with **FastAPI**, **Qdrant**, and **Redis (Lua)** designed to reduce upstream LLM latency and API costs through **tenant-isolated semantic caching (`>0.92` cosine similarity)**, **real-time Server-Sent Events (SSE) streaming (`<150ms` TTFB)**, and **atomic token-budget rate limiting**.
+An asynchronous LLM proxy built with **FastAPI**, **Qdrant**, **Redis (Lua)**, and **Sentence-Transformers**. Designed to minimize LLM API costs and latency via vector-based semantic caching, Server-Sent Events (SSE) token streaming, atomic token-budget rate limiting, and circuit-breaker fallbacks.
 
 ---
 
-## Architecture
+## System Architecture
 
 ```mermaid
-flowchart LR
-    Client([Client Request]) --> FastAPI[FastAPI Async Proxy]
-    FastAPI -->|1. EVALSHA < 2ms| Redis[(Redis Lua Token Limiter)]
-    Redis -- 429 Exceeded --> Client
-    FastAPI -->|2. 384-d MiniLM Vector + Filter| Qdrant[(Qdrant Vector Cache)]
-    Qdrant -- "HIT (Cosine >= 0.92)" --> SSE[Async SSE Streamer]
-    Qdrant -- "MISS (< 0.92)" --> Upstream[Groq / OpenAI API]
-    Upstream -->|Chunk-by-Chunk Stream| SSE
-    SSE -->|text/event-stream| Client
-    SSE -.->|Non-Blocking Background Upsert| Qdrant
+flowchart TD
+    Client([Client Request\nPOST /v1/chat/completions]) --> RL{Redis + Lua\nToken Rate Limiter}
+    
+    RL -- "Budget Exceeded" --> HTTP429([HTTP 429\nToo Many Requests - 5.2ms])
+    RL -- "Tokens Reserved" --> Embed[Sentence-Transformers\nall-MiniLM-L6-v2\n384-dim Normalized Vector]
+    
+    Embed --> Qdrant[(Qdrant Vector DB\nCosine Similarity Search)]
+    
+    Qdrant -- "Similarity >= 0.90\n(CACHE HIT)" --> SSEHit[Async SSE Stream\nX-Cache: HIT]
+    Qdrant -- "Similarity < 0.90\n(CACHE MISS)" --> Upstream[Upstream LLM Proxy\nGroq / OpenAI Async Stream]
+    
+    Upstream -- "Timeout / 5xx Error" --> CB[Circuit Breaker\nGraceful Degraded Stream]
+    Upstream -- "Stream Complete" --> Upsert[Deduct Completion Tokens\n& Upsert Vector to Qdrant]
+    
+    SSEHit --> ClientOut([Real-Time SSE Client Stream])
+    Upstream --> ClientOut
+    CB --> ClientOut
 ```
 
-## Key Engineering Highlights
+---
 
-* **Tenant & Session-Isolated Semantic Caching:** Embeds incoming prompts in ~10ms using an in-memory `all-MiniLM-L6-v2` (384-d) model and queries Qdrant with composite metadata filters (`org_id` + `session_id`) to guarantee zero cross-session or cross-tenant cache pollution.
-* **Sub-150ms TTFB Server-Sent Events (SSE) Streaming:** Streams LLM completion tokens chunk-by-chunk over `text/event-stream`. Cache population happens asynchronously after stream completion so vector persistence never blocks Time to First Byte (TTFB).
-* **Atomic Redis Lua Token-Budget Rate Limiting:** Enforces per-organization prompt and completion token budgets using a single-roundtrip Redis Lua script (`EVALSHA`), backed by a fail-open circuit breaker so cache/Redis blips never drop active traffic.
+## Key Engineering Features
+
+1. **Vector Semantic Caching (`Qdrant` + `all-MiniLM-L6-v2`):** Converts incoming prompts into normalized 384-dimensional embeddings and queries Qdrant using Cosine Distance. Paraphrased prompts matching $\ge 0.90$ similarity are served directly from cache without calling upstream LLMs.
+2. **Real-Time Async SSE Streaming:** Streams responses token-by-token over `text/event-stream` (`StreamingResponse`) with custom diagnostic headers (`X-Cache`, `X-Similarity-Score`, `X-Lookup-Latency-Ms`, `X-Tokens-Remaining`).
+3. **Atomic Token-Aware Rate Limiting (`Redis` + `Lua`):** Executes a server-side Lua script via `EVALSHA` to atomically enforce per-organization (`org_id`) prompt and completion token budgets over a 60-second sliding window, eliminating race conditions under concurrent load.
+4. **Circuit Breaker Resiliency:** Wraps upstream LLM completions (`AsyncOpenAI` / Groq) with strict async timeouts and automatic fallback streaming if the upstream provider experiences downtime or rate-limit errors.
 
 ---
 
-## Latency & Performance Benchmarks (Local Docker Stack)
+## Benchmark Results
 
-| Path | Cosine Similarity | Lookup / TTFB Latency (p50) | Latency (p95) | Upstream Token Cost |
-| :--- | :--- | :--- | :--- | :--- |
-| **Semantic Cache HIT** | `>= 0.92` | **~11.4 ms** | **~18.2 ms** | **0 tokens (100% saved)** |
-| **Semantic Cache MISS (SSE)** | `< 0.92` | **~95–135 ms TTFB** | **~148 ms TTFB** | Standard upstream |
-| **Redis Lua Budget Check** | — | **~0.8 ms** | **~1.6 ms** | — |
+Measured locally using `benchmark.py` (`httpx.AsyncClient`, 50 requests, concurrency = 4, mixed exact and paraphrased queries):
+
+| Metric | Result | Target |
+| :--- | :--- | :--- |
+| **Single-Request Cache Hit TTFT** | **52.8 ms** | `< 150 ms` |
+| **Concurrent Cache Hit TTFT (p50)** | **119.1 ms** | `< 150 ms` |
+| **Concurrent Cache Hit TTFT (p95)** | **166.2 ms** | `< 200 ms` |
+| **Throughput (Concurrency = 4)** | **31.2 req/s** | `> 20 req/s` |
+| **Paraphrase Cache Hit Rate** | **100.0%** | `> 90%` |
+| **Redis + Lua Rate Limit Rejection** | **5.2 ms** | `< 10 ms` |
 
 ---
 
-## Quickstart
+## Quick Start
 
-### 1. Start Qdrant & Redis via Docker Compose
+### 1. Start Qdrant & Redis Containers
 ```bash
 docker compose up -d
 ```
 
-### 2. Install Dependencies & Run Server
+### 2. Install Dependencies & Run Gateway
 ```bash
-python3 -m venv venv
-source venv/bin/activate  # On Windows: .\venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload
 ```
 
-### 3. Test Semantic Cache & Session Isolation
-Open Swagger UI at `http://localhost:8000/docs` or run:
-
+### 3. Run the Benchmark Suite
 ```bash
-# Request 1: Cache MISS (Streams response & caches embedding in Qdrant)
-curl -i -N -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"org_id": "org_1", "session_id": "s1", "prompt": "How do I scale Kubernetes pods horizontally?"}'
-
-# Request 2: Paraphrased prompt in same session -> Cache HIT (Score ~0.96, Lookup ~12ms)
-curl -i -N -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"org_id": "org_1", "session_id": "s1", "prompt": "How can I horizontally scale pods in Kubernetes?"}'
+python benchmark.py
 ```
