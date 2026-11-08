@@ -13,3 +13,18 @@ services:
     container_name: ai-gateway-redis
     ports:
       - "6379:6379"
+
+  gateway:
+    build: .
+    container_name: ai-gateway-api
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - REDIS_URL=redis://redis:6379
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    depends_on:
+      - qdrant
+      - redis
